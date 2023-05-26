@@ -1,0 +1,524 @@
+---
+title: "RefLim: Quick & Easy Verification of Reference Limits in Laboratory Medicine"
+author: "Georg Hoffmann & Frank Klawonn"
+output: html_document
+---
+
+* German Heart Center Munich, [Institute for Laboratory Medicine](https://www.dhm.mhn.de/de/kliniken_und_institute/institut_fuer_laboratoriumsmed/forschung_und_lehre/forschungslabor/forschungs-team_.cfm), and [Trillium GmbH](https://www.trillium.de/), Grafrath
+* Helmholtz Centre for Infection Research, [Dept. of Biostatistics](https://www.helmholtz-hzi.de/en/research/research-topics/bacterial-and-viral-pathogens/biostatistics/our-research/), Braunschweig, and Ostfalia University of Applied Sciences, Dept. of Computer Science, Wolfenbüttel 
+
+# Contents
+1. [Background](#background)
+2. [Example](#example)
+3. [The Challenge](#challenge)
+4. [The Solution](#solution)
+5. [Step 1: Bowley's Quartile Skewness](#step1)
+6. [Step 2: iBoxplot95](#step2)
+7. [Step 3: Quantile-Quantile Plot](#step3)
+8. [The Final RefLim Algorithm](#final)
+9. [Conclusion and Acknowledgement](#conclusion)
+
+## Background <a name = "background"></a>
+
+According to [international regulations](https://www.degruyter.com/document/doi/10.1515/cclm-2018-0059/html), medical laboratories are required to verify the *reference intervals*, which they have adopted from product sheets or other external sources. [By definition](https://en.wikipedia.org/wiki/Reference_range), reference intervals (also called reference ranges) include the central 95% of results measured in a [minimum of 120 non-diseased reference individuals](https://www.researchgate.net/publication/326634570_Distinguishing_reference_intervals_and_clinical_decision_limits_-_A_review_by_the_IFCC_Committee_on_Reference_Intervals_and_Decision_Limits).
+
+We describe here an indirect three-step procedure, called the *RefLim algorithm*, for verifying given reference intervals. Our method can be applied to routine laboratory data stored in a laboratory information system. It combines simplicity with robustness.
+
+### Example <a name = "example"></a>
+
+Suppose we made 120 measurements that approximately follow a normal distribution with mean 140 and standard deviation 10. Let us call this data set *x.norm*.
+
+```{r}
+set.seed(123)
+x.norm <- round(rnorm(n = 120, mean = 140, sd = 10))
+print(sort(x.norm))
+hist(x.norm)
+```
+
+*x.norm* could represent, for example, measurements of hemoglobin in women in g/l. The reference interval, which we take from the literature, is 120 to 160 g/l. To verify this specification against our own data, we determine the 2.5th and 97.5th percentiles, between which we expect the central 95% of all values.
+
+```{r echo = FALSE}
+x.norm <- round(rnorm(n = 120, mean = 140, sd = 10))
+d.norm <- density(x.norm)
+hist(x.norm, freq = F, col = "white", 
+     xlim = c(110, 190), ylim = c(0, max(d.norm$y) * 1.2),
+     main = "hemoglobin (f)", xlab = "g/l", ylab = "", yaxt = "n")
+lines(d.norm, lty = 2)
+curve(dnorm(x, 140, 10), 110, 170, lwd = 2, col = "green", add = TRUE)
+q0.025 <- round(quantile(x.norm, 0.025))
+q0.975 <- round(quantile(x.norm, 0.975))
+abline(v = c(q0.025, q0.975), lwd = 2, col = "blue")
+arrows(q0.025, max(d.norm$y) * 1.2, q0.975, code = 3)
+text(q0.025, max(d.norm$y) * 1.1, q0.025, pos = 4)
+text(q0.975, max(d.norm$y) * 1.1, q0.975, pos = 2)
+legend("topright", lwd = c(2, 1), lty = c(1, 2), col = c("green", "black"), 
+       legend = c("theoretical density", "empirical density"), bty = "n")
+```
+
+If the two numbers we get happen to be 120 and 160, we can consider the pre-defined reference interval confirmed. However, this will rarely be the case.
+
+### The Challenge <a name = "challenge"></a>
+
+As you may have noticed, we get slightly different histograms each time we run our little program. So whether we confirm the given setpoints of 120 and 160 exactly or not depends on random influences, which we simulated by the *rnorm()* function.
+
+```{r echo = FALSE}
+par (mfrow = c(3, 3), mai = rep(0.3, 4))
+for(i in 1 : 9){
+  x.norm <- round(rnorm(120, 140, 10))
+  d.norm <- density(x.norm)
+  hist(x.norm, freq = F, col = "white", 
+      main = "", xlab = "g/l", ylab = "", yaxt = "n")
+  lines(d.norm, lty = 2)
+  q0.025 <- round(quantile(x.norm, 0.025))
+  q0.975 <- round(quantile(x.norm, 0.975))
+  abline(v = c(q0.025, q0.975), lwd = 2, col = c("blue", "red"))
+  text(q0.025, max(d.norm$y) * 0.9, q0.025, pos = 4)
+  text(q0.975, max(d.norm$y) * 0.9, q0.975, pos = 2)
+}
+```
+
+In reality, these influences are probably even more pronounced than in our simulation, since we can never completely rule out slight deviations from what we call "normal" when selecting reference subjects. In the case of hemoglobin this may apply, for example, to women with undetected iron deficiency or increased menstrual bleeding.
+
+So what we are looking for is a simple and robust algorithm that identifies the "presumably normal individuals" even in a mixed population of healthy and sick persons and calculates the 2.5th and 97.5th percentiles for this subpopulation.
+
+## The Solution <a name = "solution"></a>
+
+To solve this task, we propose an algorithm consisting of three steps:
+
+1. calculate Bowley's skewness coefficient and logarithmize the data if the transformation markedly reduces the skewness towards zero
+2. remove all data that fall outside the expected 95% range of the "presumably normal" subpopulation using the iBoxplot95 algorithm
+3. construct a quantile-quantile plot (q-q plot) and calculate the reference interval from its central linear part.
+
+Most of the theoretical background of these three algorithms has been published by [Hoffmann G et al in J Lab Med 2016](https://www.degruyter.com/document/doi/10.1515/labmed-2015-0104/html) and [Klawonn F et al in J Lab Med 2020](https://www.degruyter.com/document/doi/10.1515/labmed-2020-0005/html). Here, we focus on their practical implementation in R.
+
+### Step 1: Bowley's Quartile Skewness <a name = "step1"></a>
+
+Some laboratory results show a more or less symmetric distribution, which can be modeled by a Gaussian normal distribution. However, most distributions in laboratory medicine are right skewed and thus can be better approximated by a lognormal distribution. The skewness of a distribution can be illustrated with John W Tukey's boxplot. The "box" covers the central 50% of the values; it extends from the 25th to the 75th percentile with a bold line at the 50th percentile (the median). These three percentiles are referred to as *quartiles* (Q1, Q2 and Q3), and the range of the box (Q1  to Q3) is called the *interquartile range (IQR)*.
+
+```{r echo = FALSE}
+x.norm <- qnorm((1 : 999)/1000, 140, 10)  #normal distribution
+x.lognorm <- qlnorm((1 : 999)/1000, 3.8, 0.42) #lognormal distribution
+x <- cbind(x.lognorm, x.norm)
+boxplot(x, horizontal = TRUE)
+grid()
+text(quantile(x.norm, 0.5), 2.5, "Q2", col = "blue")
+text(quantile(x.norm, c(0.25, 0.75)), 1.5, c("Q1", "Q3"), col = "blue")
+text(quantile(x.lognorm, 0.5), 1.5, "Q2", col = "red")
+text(quantile(x.lognorm, c(0.25, 0.75)), 0.5, c("Q1", "Q3"), col = "red")
+```
+
+The upper boxplot shows a normally distributed data set representative of hemoglobin, the lower one a lognormally distributed data set that could represent, for example, serum amylase. Let's take a closer look at the two halves of the grey boxes. Their proportions reflect the symmetry of the normal distribution (upper plot) and the asymmetry of the lognormal distribution (lower plot). Bowley's skewness coefficient *BS* quantifies this visual impression by comparing the width of the left half (Q2 - Q1) with that of the right one (Q3 - Q2). Here is the exact formula:
+
+$BS = \frac{(Q3-Q2)-(Q2-Q1)}{Q3-Q1} = \frac{Q1-2Q2+Q3}{Q3-Q1}$
+
+If *BS* is about 0, an approximately normal distribution can be assumed. A clearly positive *BS* indicates a lognormal distribution. 
+
+So, let's introduce a function called *bowley()* to calculate *BS* and apply it to x.norm and x.lognorm.
+
+```{r}
+bowley <- function(x){
+  Q <- quantile(x, c(0.25, 0.5, 0.75), na.rm = TRUE)
+  BS <- (Q[1] - 2 * Q[2] + Q[3]) / (Q[3] - Q[1])
+  return (as.numeric(BS))
+}
+bowley(x.norm)
+bowley(x.lognorm)
+```
+
+The algorithm for the detection of lognormal distributions compares the skewness of the original and the logarithmized data and sets an empirical cutoff value of 0.05. The simple idea behind this algorithm is that log transformation converts a lognormal to a normal distribution so that the Bowley skewness decreases. If the transformation brings the skewness closer to zero the algorithm suggests assuming a lognormal distribution model.
+
+```{r}
+def.lognorm <- function(x, cutoff = 0.05){
+  if(min(x) <= 0){
+    stop("(def.lognorm) only positive values allowed.")
+  }
+  return(bowley(x) - bowley(log(x)) >= cutoff)
+}
+def.lognorm(x.norm)
+def.lognorm(x.lognorm)
+```
+
+The result *FALSE* means that x.norm should NOT be transformed, whereas *TRUE* means that x.lognorm actually should be logarithmized.
+
+The nice thing about this simple algorithm is its robustness compared to other skewness measures because it regards just the central 50% of the data where the presence of pathological outliers is unlikely. 
+
+Let us prove this claim by "contaminating" x.norm and x.lognorm with 20% pathological outliers. We call these mixed populations *x.norm.mix* and *x.lognorm.mix*. 
+
+```{r}
+set.seed(123)
+x.norm.mix <- c(rnorm(n = 800, mean = 140, sd = 10), 
+                rnorm(n = 150, mean = 110, sd = 15), 
+                rnorm(n = 50, mean = 170, sd = 15)) 
+x.lognorm.mix <- c(rlnorm(n = 800, meanlog = 3.8, sdlog = 0.42), 
+                   rnorm(n = 50, mean = 15, sd = 3), 
+                   rnorm(n = 150, mean = 140, sd = 25))
+```
+
+
+Their distribution nicely reflects that of real laboratory data.
+
+```{r}
+plot(density(x.norm.mix), lty = 2,
+     xlim = c(0, 250), ylim = c(0, 0.035),
+     main = "density curves of mixed populations", 
+     xlab = "arbitrary units", ylab = "")
+lines(density(x.lognorm.mix), lty = 3)
+grid()
+curve(dnorm(x, 140, 10) * 0.8, 100, 200, col = "blue", lwd = 2, add = TRUE)
+curve(dlnorm(x, 3.8, 0.42) * 0.8, 10, 150, col = "red", lwd = 2, add = TRUE)
+legend("topleft", lwd = 2, col = c("red", "blue"),
+       legend = c(ifelse(def.lognorm(x.lognorm.mix), "lognormal", "normal"),
+                  ifelse(def.lognorm(x.norm.mix), "lognormal", "normal")))
+```
+
+The dashed and dotted density curves represent the contaminated data, the red and blue lines the theoretical densities of the uncontaminated original data. Note that the legend has been created from the contaminated data using the *def.lognorm* function. If we logarithmize *x.lognorm.mix* (red) while we leave *x.norm.mix* (blue) untouched, we get two fairly symmetric distributions. The x-axis in the left plot shows logarithms while the x-axis on the right represents the original values. Both can now be analyzed with standard Gaussian statistics.
+
+```{r echo = FALSE}
+par(mfrow = c(1, 2), mai = rep(0.4, 4))
+d1 <- density(x.norm.mix)
+d2 <- density(log(x.lognorm.mix))
+hist(log(x.lognorm.mix), freq = FALSE, col = "white",
+     breaks = 20, ylim = c(0, max(d2$y) * 1.2),
+     main = "x.lognorm.mix", xlab = "log(x)", ylab = "")
+lines(density(log(x.lognorm.mix)), lty = 2)
+curve(dnorm(x, 3.8, 0.42) * 0.8, min(d2$x), max(d2$x), 
+      col = "red", lwd = 2, add = TRUE)
+hist(x.norm.mix, freq = FALSE, col = "white",
+     breaks = 20, ylim = c(0, max(d1$y) * 1.2),
+     main = "x.norm.mix", xlab = "x", ylab = "")
+lines(density(x.norm.mix), lty = 2)
+curve(dnorm(x, 140, 10) * 0.8, min(d1$x), max(d1$x), 
+      col = "blue", lwd = 2, add = TRUE)
+par(mfrow = c(1, 1))
+
+```
+
+### Step 2: iBoxplot95 <a name = "step2"></a>
+
+Once we have defined the distribution type and performed a log transformation if needed, the next step is to remove as much pathological "contamination" as possible without truncating the "normal" data too much. Our approach is again based on Tukey's boxplot, but this time we look at the whiskers rather than the boxes. The points outside the whisker ends give an idea of the number and location of outliers, but Tukey's fences for outlier detection are not standardized enough to derive clean statistical assumptions. The bold colored lines shown below are the theoretical reference limits, where we want to truncate our mixed populations. So basically, what we need are shorter whiskers.
+
+```{r echo = FALSE}
+x.mix <- cbind(x.lognorm.mix, x.norm.mix)
+boxplot(x.mix, horizontal = TRUE)
+grid()
+lines(c(qnorm(0.025, 140, 10), qnorm(0.025, 140, 10)), c(1.8, 2.2), 
+      lwd = 4, col = "blue")
+lines(c(qnorm(0.975, 140, 10), qnorm(0.975, 140, 10)), c(1.8, 2.2), 
+      lwd = 4, col = "blue")
+lines(c(qlnorm(0.025, 3.8, 0.42), qlnorm(0.025, 3.8, 0.42)), c(0.8, 1.2), 
+      lwd = 4, col = "red")
+lines(c(qlnorm(0.975, 3.8, 0.42), qlnorm(0.975, 3.8, 0.42)), c(0.8, 1.2), 
+      lwd = 4, col = "red")
+```
+
+In the original boxplot, the whisker length is calculated from the width of the whole box (Q3-Q1) times a factor of 1.5. In our modified approach we compute instead the two halves of the interquartile range (Q2-Q1 and Q3-Q2) separately and consider the smaller one to be less affected by potential outliers. We multiply its width with a "quantile factor" *qf ≈ 2.9* and obtain thus the distance of the colored truncation points on the left and right of the median. 
+
+The factor of 2.9 makes sure that the truncation points cover the interval between the 2.5% and the 97.5% quantiles of a normal distribution. It is derived from *qnorm(0.025)/qnorm(0.25)*:
+
+```{r}
+qnorm(0.025) / qnorm(0.25)
+```
+
+Here is an appropriate truncation function called *truncate.x()*:
+
+```{r}
+truncate.x <- function(x, qf){
+    Q <- quantile(x, c(0.25, 0.5, 0.75))	
+    var1 <- Q[2] - Q[1]
+    var2 <- Q[3] - Q[2]
+    var <- min(var1, var2)
+    lim <- c(Q[2] - qf * var, Q[2] + qf * var)
+    return(subset(x, x >= lim[1] & x <= lim[2]))
+  } 
+```
+
+When we apply *truncate.x()* to *x.norm.mix*, we get an almost perfectly  truncated data set that is just slightly wider than the theoretical reference interval of 120 to 160.
+
+```{r}
+x.norm.mix.trunc <- truncate.x(x.norm.mix, qf = 2.9)
+round(c(min(x.norm.mix.trunc), max(x.norm.mix.trunc)))
+```
+
+To get as close as possible to the desired truncation, we run this algorithm repeatedly until no more outliers are removed. You may use the following *iBoxplot95* function (where i stands for *iterative* and 95 for *95%*).
+
+```{r}
+iBoxplot95 <- function(x, lognorm = NULL){
+  xx <- na.omit(x)
+  if(is.null(lognorm)){lognorm <- def.lognorm(xx)}
+  if(lognorm){xx <- log(xx)}
+  
+  #sets starting parameters
+  n0 <- 1
+  n1 <- 0
+  qf <- 2.9
+  i <- 1
+  #truncates xx repeatedly until no more outliers are detected
+  while (n0 > n1){
+    n0 <- length(xx)
+    xx <- truncate.x(xx, qf = qf)
+    n1 <- length(xx)
+    qf <- 3.1
+  }
+  if (lognorm){xx <- exp(xx)}
+  return(xx)
+}
+```
+
+This function automatically defines the distribution type, loarithmizes the data if needed, and returns the truncated data set. Note that the quantile factor *qf* is slightly increased from 2.9 to 3.1 after the first truncation step. This modification takes into account that after step 1 you truncate an already truncated distribution. Without going into the statistical details, the modified *qf* is calculated from
+
+``` {r}
+qnorm(0.025)/qnorm(0.25 * 0.95 + 0.025)
+```
+
+Let's apply the *iBoxplot95* function to the two mixed populations now. 
+
+```{r}
+x.norm.mix.trunc <- iBoxplot95(x.norm.mix)
+x.lognorm.mix.trunc <- iBoxplot95(x.lognorm.mix)
+```
+
+```{r echo = FALSE}
+par(mfrow = c(2, 2), mai = c(0.6, 0.4, 0.4, 0.4))
+#calculates theoretical reference intervals
+limits.norm <- round(qnorm(c(0.025, 0.975), 140, 10))
+limits.lognorm <- round(qlnorm(c(0.025, 0.975), 3.8, 0.42))
+
+boxplot(x.norm.mix, horizontal = TRUE, boxwex = 0.3,
+        main = "x.norm.mix")
+grid()
+lines(c(limits.norm[1], limits.norm[1]), c(0.85, 1.15), col = "blue", lwd = 3)
+lines(c(limits.norm[2], limits.norm[2]), c(0.85, 1.15), col = "blue", lwd = 3)
+text(limits.norm[1], 1.25, limits.norm[1])
+text(limits.norm[2], 1.25, limits.norm[2])
+boxplot(x.norm.mix.trunc, horizontal = TRUE, boxwex = 0.3,
+        ylim = c(min(x.norm.mix), max(x.norm.mix)),
+        main = "x.norm.mix.trunc")
+grid()
+text(min(x.norm.mix.trunc), 1.25, round(min(x.norm.mix.trunc)))
+text(max(x.norm.mix.trunc), 1.25, round(max(x.norm.mix.trunc)))
+
+boxplot(x.lognorm.mix, horizontal = TRUE, boxwex = 0.3,
+        main = "x.lognorm.mix")
+grid()
+lines(c(limits.lognorm[1], limits.lognorm[1]), c(0.85, 1.15), col = "red", lwd = 3)
+lines(c(limits.lognorm[2], limits.lognorm[2]), c(0.85, 1.15), col = "red", lwd = 3)
+text(limits.lognorm[1], 1.25, limits.lognorm[1])
+text(limits.lognorm[2], 1.25, limits.lognorm[2])
+boxplot(x.lognorm.mix.trunc, horizontal = TRUE, boxwex = 0.3,
+        ylim = c(min(x.lognorm.mix), max(x.lognorm.mix)),
+        main = "x.lognorm.mix.trunc")
+grid()
+text(min(x.lognorm.mix.trunc), 1.25, round(min(x.lognorm.mix.trunc)))
+text(max(x.lognorm.mix.trunc), 1.25, round(max(x.lognorm.mix.trunc)))
+```
+
+The plots show that the truncation is now almost perfect. However, tests with simulated and real data have shown that the intervals obtained in this way tend to be somewhat too narrow for normal distributions and somewhat too wide for lognormal distributions. Absolute correctness cannot be expected from such estimation procedures, but to get as close to the truth as possible, we introduce a third step.
+
+### Step 3: Quantile-Quantile Plot <a name = "step3"></a>
+
+A quantile-quantile plot (shortly called q-q plot) compares two sequences of quantiles that are derived from two different data sets. If the respective scatter plot forms an approximately straight line, both data sets can be assumed to have about the same distribution.
+
+R provides a function called *qqnorm()* that compares any distribution with a standard normal distribution:
+
+```{r}
+qqnorm(x.norm)
+qqnorm(x.lognorm)
+```
+
+The straight line in the upper figure confirms that *x.norm* is normally distributed, and the curved line below says that *x.lognorm* is not normally distributed.
+
+For our own purposes we need a customized version of *qqnorm()*, which we call  *qqPlot95()*. It compares a truncated set of data (derived from *iBoxplot95*) with a truncated standard normal distribution and computes the 2.5th and 97.5th percentiles from a regression line passing through the central part of the graph (to eliminate interference from potential outliers at the edges of the truncated data).
+
+```{r}
+qqPlot95 <- function(x, lognorm = NULL, n.quantiles = 100, apply.rounding = TRUE, plot.it = TRUE,
+                    main = "q-q plot", xlab = "Theoretical Quantiles", ylab = "Sample Quantiles"){
+  xx <- na.omit(x)
+  digits <- 2 - floor(log10(median(xx))) # Finds reasonable number of digits
+  if(is.null(lognorm)){lognorm <- def.lognorm(xx)}  
+  if(lognorm){xx <- log(xx)}
+  xx.trunc <- iBoxplot95(xx, lognorm = F)
+  
+  p1 <- seq(from = 0.025, to = 0.975, length.out = n.quantiles)   #x.axis
+  p2 <- seq(from = 0, to = 1, length.out = n.quantiles)           #y.axis
+  x.ax <- qnorm(p1)              #quantiles of standard normal distribution
+  y.ax <-quantile(xx.trunc, p2)  #quantiles of sample distribution
+  
+  #calculates linear regression coefficients from the central 50% of the curve
+  central.part <- floor((0.25 * n.quantiles) : ceiling(0.75 * n.quantiles))
+  reg <- lm(y.ax[central.part] ~ x.ax[central.part])
+  a <- reg$coefficients[2]
+  b <- reg$coefficients[1]
+  result <- c(b, a, b - 1.96 * a, b + 1.96 * a)
+  result <- setNames(result, c("mean", "sd", "lower.lim", "upper.lim"))
+  if(lognorm){
+    names(result)[1 : 2] <- paste0(names(result)[1 : 2], "log")
+    if(apply.rounding){
+      result[1 : 2] <- round(result[1 : 2], 3)
+      result[3 : 4] <- round(exp(result[3 : 4]), digits)
+    }
+  } else {
+    if(apply.rounding){
+      result <- round(result, digits)
+    }
+  }
+  if(result[3] < 0){result[3] <- 0}  
+    # draw q-q plot
+  if (plot.it){
+    if(!lognorm){
+      ll <- result[3]
+      ul <- result[4]
+      diff <- ul - ll
+      plot(y.ax ~ x.ax, xlim = c(-3, 3), 
+           ylim = c(ll - 0.2 * diff, ul + 0.2 * diff), 
+           main = main, xlab = xlab, ylab = ylab)
+    }else{
+      ll <- log(result[3])
+      ul <- log(result[4])
+      diff <- ul - ll
+      plot(y.ax ~ x.ax, yaxt = "n", xlim = c(-3, 3), 
+           ylim = c(ll - 0.2 * diff, ul + 0.2 * diff), 
+           main = main, xlab = xlab, ylab = ylab)
+      y.pos <- quantile(y.ax, c(0.01, 0.2, 0.5, 0.8, 0.99))
+      axis(2, at = y.pos,labels  = round(exp(y.pos), digits - 1))
+    }
+    grid()
+    abline(v = 0)
+    abline(v = c(-1.96, 1.96), lty = 2)
+    abline(h = c(ll, ul), 
+           col = "green", lwd = 2)
+    abline(reg$coefficients, lwd = 2, col = "blue")
+    if(digits > 0){digits <- digits - 1}
+    legend("topleft", 
+           paste(formatC(result[3], digits, format = "f"), "-", 
+                 formatC(result[4], digits, format = "f")), bty = "n", cex = 1.5)
+  }
+  return(result)
+}
+```
+
+This function is a bit longer than the preceding ones as it not only returns the results of the calculation. It also visualizes the q-q plot with the estimated reference interval in the upper left corner, thereby taking into account the distribution type (normal or lognormal) of the original data.
+This specific graphical representation is important for the validation of the result quality. 
+
+So, let us apply this function to the two mixed populations *x.norm.mix* and *x.lognorm.mix*.
+
+```{r}
+qqPlot95(x.norm.mix, main = "x.norm.mix")
+qqPlot95(x.lognorm.mix, main = "x.lognorm.mix")
+
+```
+
+The two q-q plots are fairly linear with just slight deviations at the edges. The estimated reference limits are depicted in the upper left corners of the graphs. They are close to, but of course not identical with, the theoretical 2.5th and 97.5th percentiles of the underlying normal and lognormal distributions, respectively. The theoretical target values are 120 to 160 and 20 to 102, respectively:
+
+```{r}
+round(qnorm(c(0.025, 0.975), 140, 10))
+round(qlnorm(c(0.025, 0.975), 3.8, 0.42))
+```
+
+### The Final RefLim Algorithm <a name = "final"></a>
+
+As a final step, we need a mechanism that tells us whether the estimated reference limits are significantly different from the target values or not. To achieve this, we combine the above three steps with a calculation of 95% confidence intervals. The function *ci.quant95()* returns the 95% confidence limits for the lower and the upper reference limits. 
+
+```{r}
+ci.quant95 <- function(n, lower.limit, upper.limit, lognorm = FALSE, apply.rounding = TRUE){
+  if(upper.limit <= lower.limit){stop("(ci.quant95) upper limit must be higher than lower limit")}
+  digits <- 2 - floor(log10(upper.limit)) # Finds reasonable number of digits
+  if(lognorm){
+    lower.limit <- log(lower.limit)
+    upper.limit <- log(upper.limit)
+  }
+  sigma <- (upper.limit - lower.limit) / 3.92
+  result <- rep(0, 4)
+  names(result) <- c("low.lim.low", "low.lim.upp", "upp.lim.low", "upp.lim.upp")
+  
+  diff.outer <- sigma*5.81/(sqrt(n)+0.66)
+  diff.inner <- sigma*7.26/(sqrt(n)-5.58)
+  result[1] <- lower.limit - diff.outer
+  result[2] <- lower.limit + diff.inner
+  result[3] <- upper.limit - diff.inner
+  result[4] <- upper.limit + diff.outer
+  
+  if (lognorm){result <- exp(result)}
+  if(apply.rounding){result = round(result, digits)}
+  return(result)
+}
+```
+
+If the target values are within these limits, the predefined reference limits can be considered confirmed, if not, they should be checked more closely.
+
+```{r}
+ci.quant95(n = 1000, lower.limit = 121, upper.limit = 159, lognorm = FALSE)
+ci.quant95(n = 1000, lower.limit = 20, upper.limit = 109, lognorm = TRUE)
+```
+
+These results tell us that both reference intervals are in accordance with the estimates obtained from our mixed populations. This is illustrated in the next graph: the dotted boxes indicate the theoretical reference intervals, the thick lines within the green boxes represent the real estimates within their respective confidence intervals.
+
+```{r echo = FALSE}
+par(mfrow = c(1, 1), mai = rep(0.4, 4))
+plot(0, 0, type = "n", xlim = c(0, 175), ylim = c(0.5, 2.5), 
+     yaxt = "n", xlab = "", ylab = "") 
+axis(2, at = c(1, 2),labels  = c("x.lognorm.mix", "x.norm.mix"))     
+grid()
+rect(c(119, 156), 1.75, c(124, 161), 2.25, col = "lightgreen", border = NA)
+lines(c(121, 121), c(1.75, 2.25), lwd = 3, col = "darkgreen")
+lines(c(159, 159), c(1.75, 2.25), lwd = 3, col = "darkgreen")
+rect(120, 1.8, 160, 2.2, lty = 2)
+rect(c(19, 97), 0.75, c(23, 118), 1.25, col = "lightgreen", border = NA)
+lines(c(20, 20), c(0.75, 1.25), lwd = 3, col = "darkgreen")
+lines(c(109, 109), c(0.75, 1.25), lwd = 3, col = "darkgreen")
+rect(20, 0.8, 102, 1.2, lty = 2)
+```
+
+This brings us to the end of our considerations and we can put together all the functions worked out in this article. Here is a proposal for the final *RefLim()* function.
+
+```{R}
+RefLim <- function(x, lognorm = NULL, n.quantiles = 100, apply.rounding = TRUE, plot.it = TRUE,
+                    main = "q-q plot", xlab = "Theoretical Quantiles", ylab = "Sample Quantiles"){
+  # x: vector of a minimum of 100 positive numbers (laboratory results)
+  # lognorm: optional TRUE or FALSE. If NULL, distribution type is determined automatically
+  # plot.it: optional graphical q-q plot of truncated data
+  # returns estimated reference limits with 95% confidence intervals
+
+  xx <- na.omit(x)  
+  if(length(xx) < 100){stop("(RefLim) a minimum of 100 numeric values is needed.")}
+  if(min(xx) <= 0){stop("(RefLim) only positive numeric values allowed.")}
+  
+  if(is.null(lognorm)){lognorm <- def.lognorm(xx)}
+  result1 <- qqPlot95(xx, lognorm = lognorm, n.quantiles = n.quantiles, 
+                      apply.rounding = apply.rounding, plot.it = plot.it, 
+                      main = main, xlab = xlab, ylab = ylab)
+  result2 <- ci.quant95(n = length(xx), lognorm = lognorm, 
+                        lower.limit = result1[3], upper.limit = result1[4])
+  return(c(result1, result2))
+}
+```
+
+This function can easily be applied to *x.norm.mix* with just one line of code:
+
+```{r}
+RefLim(x.norm.mix)
+```
+
+To take full advantage of the *RefLim* functionality, parameters can be set individually and the results passed to a variable for further processing. Here is an example:
+
+
+```{r}
+amylase.lim <- RefLim(x.lognorm.mix, n.quantiles = 200, main = "q-q plot for amylase", ylab = "U/l")
+amylase.res <- data.frame("RL" = amylase.lim[3 : 4],
+                          "ci95" = c(paste(amylase.lim[5], "-", amylase.lim[6]),
+                                     paste(amylase.lim[7], "-", amylase.lim[8])),
+                          "target" = c(20, 102))
+rownames(amylase.res) <- c("lower", "upper")
+amylase.res
+write.csv(amylase.res, "amylase.csv", quote = FALSE)
+```
+
+The result is a customized q-q plot with 200 instead of 100 quantiles and a table with estimates for the lower and upper reference limits (RL) including 95% confidence intervals (ci95) and theoretical target values. This table was saved as a csv file *amylase.csv* in the active folder (working directory).
+
+## Conclusion and Acknowledgement <a name = "conclusion"></a>
+
+The *RefLim* function provides a simple and robust method for checking specified reference intervals from package inserts or other external sources against your own measured values. In this article we have used simulated values, but of course one can query corresponding values from the laboratory information system, read them into R as a csv file and then process them in an identical way.
+
+The authors would like to thank Sandra Klawitter, Braunschweig, and Jakob Adler, Magdeburg, for valuable suggestions and proofreading the manuscript.
+
+For further questions to the authors please feel free to send a message to
+georg.hoffmann@trillium.de or Frank.Klawonn@helmholtz-hzi.de.
